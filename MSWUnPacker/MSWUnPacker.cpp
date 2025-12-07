@@ -5,81 +5,11 @@
 #include <sstream>
 #include <cstdint>
 #include <cstring>
-#include <set>
 #include "multishader.h"
 #include "dxbc.h"
 
 #define RAPIDJSON_HAS_STDSTRING 1
 
-// S7 Shader Database Feature
-// When enabled, checks if shader exists in S7 database before converting
-// If found, copies the pre-existing S7 shader instead of converting from S9
-bool g_useS7Database = false;
-fs::path g_s7DatabasePath;
-std::set<std::string> g_s7ShaderSet;  // Cached set of available S7 shader GUIDs
-
-// Initialize S7 shader database cache
-bool InitS7Database(const fs::path& dbPath) {
-    if (!fs::exists(dbPath) || !fs::is_directory(dbPath)) {
-        fprintf(stderr, "S7 database not found: %s\n", dbPath.string().c_str());
-        return false;
-    }
-
-    g_s7DatabasePath = dbPath;
-    g_s7ShaderSet.clear();
-
-    int count = 0;
-    for (const auto& entry : fs::directory_iterator(dbPath)) {
-        if (!entry.is_regular_file()) continue;
-
-        std::string ext = entry.path().extension().string();
-        for (char& c : ext) c = static_cast<char>(tolower(c));
-        if (ext != ".msw") continue;
-
-        // Store shader GUID (filename without extension)
-        std::string guid = entry.path().stem().string();
-        g_s7ShaderSet.insert(guid);
-        count++;
-    }
-
-    printf("S7 Database initialized: %d shaders available\n", count);
-    return count > 0;
-}
-
-// Check if shader exists in S7 database and copy if found
-// Returns true if S7 shader was used, false if conversion is needed
-bool TryUseS7Shader(const std::string& shaderGuid, const fs::path& outputMswPath) {
-    if (!g_useS7Database || g_s7ShaderSet.empty()) {
-        return false;
-    }
-
-    // Check if this shader exists in S7 database
-    if (g_s7ShaderSet.find(shaderGuid) == g_s7ShaderSet.end()) {
-        return false;
-    }
-
-    // Found! Copy S7 shader to output
-    fs::path s7ShaderPath = g_s7DatabasePath / (shaderGuid + ".msw");
-
-    if (!fs::exists(s7ShaderPath)) {
-        fprintf(stderr, "  [S7] Warning: %s in cache but file missing\n", shaderGuid.c_str());
-        return false;
-    }
-
-    try {
-        // Ensure output directory exists
-        if (outputMswPath.has_parent_path()) {
-            fs::create_directories(outputMswPath.parent_path());
-        }
-
-        fs::copy_file(s7ShaderPath, outputMswPath, fs::copy_options::overwrite_existing);
-        printf("  [S7] Using pre-existing S7 shader: %s\n", shaderGuid.c_str());
-        return true;
-    } catch (const fs::filesystem_error& e) {
-        fprintf(stderr, "  [S7] Error copying shader: %s\n", e.what());
-        return false;
-    }
-}
 #include "rapidjson/prettywriter.h"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/document.h"
@@ -1058,11 +988,6 @@ int convertLegacy(const char* inputPath, const char* outputPath) {
         return -1;
     }
 
-    // Check if S7 shader database has this shader (skip conversion if found)
-    if (g_useS7Database && TryUseS7Shader(shaderGuid, outputMsw)) {
-        return 1;  // Used S7 shader
-    }
-
     // Set up working directory
     if (isMswFile) {
         // Unpack MSW to temp directory
@@ -1326,16 +1251,12 @@ void convertLegacyBatch(const char* inputDir, const char* outputDir) {
     printf("=== Batch S9 to Legacy Shader Converter ===\n");
     printf("Input directory: %s\n", inputDir);
     printf("Output directory: %s\n", outputDir);
-    if (g_useS7Database) {
-        printf("S7 Database: ENABLED (%zu shaders available)\n", g_s7ShaderSet.size());
-    }
 
     // Create output directory if needed
     fs::create_directories(outputDir);
 
     int totalCount = 0;
     int convertedCount = 0;
-    int s7UsedCount = 0;
     int failedCount = 0;
 
     for (const auto& entry : fs::directory_iterator(inputDir)) {
@@ -1354,9 +1275,7 @@ void convertLegacyBatch(const char* inputDir, const char* outputDir) {
 
         try {
             int result = convertLegacy(inputMsw.c_str(), outputMsw.c_str());
-            if (result == 1) {
-                s7UsedCount++;
-            } else if (result == 0) {
+            if (result == 0) {
                 convertedCount++;
             } else {
                 failedCount++;
@@ -1372,9 +1291,6 @@ void convertLegacyBatch(const char* inputDir, const char* outputDir) {
     printf("========================================\n");
     printf("Total: %d\n", totalCount);
     printf("  Converted: %d\n", convertedCount);
-    if (g_useS7Database) {
-        printf("  Used S7:   %d\n", s7UsedCount);
-    }
     printf("  Failed:    %d\n", failedCount);
     printf("Output directory: %s\n", outputDir);
 }
@@ -1385,7 +1301,7 @@ void printUsage() {
     printf("  MSWUnPacker unpack <msw_file>           - Unpack .msw file to directory\n");
     printf("  MSWUnPacker pack <directory>            - Pack directory to .msw file\n");
     printf("  MSWUnPacker convert <directory> [version] - Convert data.json to target version\n");
-    printf("  MSWUnPacker convert-legacy <input> [output] [--use-s7] - S9->S3 with auto CB2/CB3 swap\n");
+    printf("  MSWUnPacker convert-legacy <input> [output] - S9->S3 with auto CB2/CB3 swap\n");
     printf("  MSWUnPacker convert-rsx <json> <outdir> [version] - Convert rex-rsx export to MSW format\n");
     printf("\n");
     printf("Convert versions:\n");
@@ -1409,12 +1325,6 @@ void printUsage() {
     printf("  MSWUnPacker convert-legacy shader.msw out.msw      # Single file with output\n");
     printf("  MSWUnPacker convert-legacy ./shader_dir            # Directory\n");
     printf("  MSWUnPacker convert-legacy ./s9_shaders/ ./out/    # Batch directory\n");
-    printf("  MSWUnPacker convert-legacy ./s9_shaders/ ./out/ --use-s7  # Use S7 database\n");
-    printf("\n");
-    printf("S7 Shader Database (--use-s7):\n");
-    printf("  When enabled, checks if shader exists in the S7 database before converting.\n");
-    printf("  If found, copies the pre-existing working S7 shader instead of patching S9.\n");
-    printf("  Database path: resources/s7 shaders/\n");
     printf("\n");
     printf("The convert-legacy command automatically:\n");
     printf("  1. Detects S9 CB layout (CBufCommonPerCamera at CB3)\n");
@@ -1493,53 +1403,12 @@ int main(int argc, char** argv)
     }
     else if (!strncmp(argv[1], "convert-legacy", 15)) {
         if (argc < 3) {
-            fprintf(stderr, "Usage: MSWUnPacker convert-legacy <input.msw|dir> [output.msw|dir] [--use-s7]\n");
+            fprintf(stderr, "Usage: MSWUnPacker convert-legacy <input.msw|dir> [output.msw|dir]\n");
             return 1;
         }
 
-        // Parse arguments - check for --use-s7 flag anywhere in args
-        const char* inputArg = nullptr;
-        const char* outputArg = nullptr;
-        bool useS7Flag = false;
-
-        for (int i = 2; i < argc; i++) {
-            if (!strncmp(argv[i], "--use-s7", 9)) {
-                useS7Flag = true;
-            } else if (!inputArg) {
-                inputArg = argv[i];
-            } else if (!outputArg) {
-                outputArg = argv[i];
-            }
-        }
-
-        if (!inputArg) {
-            fprintf(stderr, "Error: No input specified\n");
-            return 1;
-        }
-
-        // Initialize S7 database if flag is set
-        if (useS7Flag) {
-            // Get executable directory for relative path resolution
-            fs::path exePath(argv[0]);
-            fs::path exeDir = exePath.parent_path();
-            fs::path s7DbPath = exeDir / "resources" / "s7 shaders";
-
-            // Also try relative to current working directory
-            if (!fs::exists(s7DbPath)) {
-                s7DbPath = fs::current_path() / "resources" / "s7 shaders";
-            }
-
-            // Also try absolute path
-            if (!fs::exists(s7DbPath)) {
-                s7DbPath = "C:\\valk\\MSWUnPacker\\resources\\s7 shaders";
-            }
-
-            if (InitS7Database(s7DbPath)) {
-                g_useS7Database = true;
-            } else {
-                fprintf(stderr, "Warning: S7 database not found, continuing without it\n");
-            }
-        }
+        const char* inputArg = argv[2];
+        const char* outputArg = (argc >= 4) ? argv[3] : nullptr;
 
         // Check if input is a directory with MSW files (batch mode)
         fs::path input(inputArg);
